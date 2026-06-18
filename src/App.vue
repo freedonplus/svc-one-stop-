@@ -126,15 +126,15 @@
 </template>
 
 <script setup>
-import { ref, reactive, computed, onMounted, onUnmounted } from 'vue'
-import { Plus, Connection, Search, Select, VideoPlay, VideoPause, Setting } from '@element-plus/icons-vue'
+import { ref, reactive, computed, watch, onMounted, onUnmounted } from 'vue'
+import { Plus, Search, Select, VideoPlay, VideoPause, Setting } from '@element-plus/icons-vue'
 import { ElMessage, ElMessageBox } from 'element-plus'
 import ServiceCard from './components/ServiceCard.vue'
 import ServiceForm from './components/ServiceForm.vue'
 import LogPanel from './components/LogPanel.vue'
 import TitleBar from './components/TitleBar.vue'
 import SettingsDialog from './components/SettingsDialog.vue'
-import { GROUPS, getGroupColor, THEMES, FONT_SIZES, FONT_FAMILIES } from './constants.js'
+import { getGroupColor, THEMES, FONT_SIZES, FONT_FAMILIES } from './constants.js'
 import * as api from './api/index.js'
 
 // ─── State ───
@@ -150,7 +150,6 @@ const editingService = ref(null)
 const showLogPanel = ref(false)
 const activeLogTab = ref('')
 const logHeight = ref(250)
-const activeGroup = ref('')
 const searchQuery = ref('')
 const startingMap = reactive({})
 const failedMap = reactive({})
@@ -225,8 +224,6 @@ function setupSystemThemeListener() {
 }
 
 // ─── Computed ───
-const groupList = computed(() => [...new Set(services.value.map(s => s.group).filter(Boolean))].sort())
-
 const selectedCount = computed(() => Object.values(selectedMap).filter(Boolean).length)
 
 const stats = computed(() => {
@@ -247,7 +244,6 @@ function getStatus(id) {
 
 const filteredServices = computed(() => {
   let list = services.value
-  if (activeGroup.value) list = list.filter(s => s.group === activeGroup.value)
   const q = searchQuery.value.trim().toLowerCase()
   if (q) list = list.filter(s =>
     [s.name, s.group, s.version, s.command, s.id].some(f => (f || '').toLowerCase().includes(q))
@@ -270,8 +266,15 @@ const visibleGroups = computed(() => {
   })
 })
 
-// ─── Health & Data ───
-let pollTimer = null
+// ─── Health & Data (WebSocket + HTTP 降级兜底) ───
+let ws = null
+let wsReconnectTimer = null
+let wsRetryCount = 0
+const WS_URL = 'ws://localhost:8710/api/ws'
+const MAX_WS_RETRY = 10
+let httpFallbackTimer = null
+let logPollTimer = null
+
 async function checkHealth() {
   try { await api.healthCheck(); backendOnline.value = true; return true }
   catch { backendOnline.value = false; return false }
@@ -282,40 +285,121 @@ async function loadServices() {
     if (!await checkHealth()) { loading.value = false; return }
     lastError.value = ''
     const data = await api.fetchServices()
-    services.value = data.services || []
-    Object.assign(statuses, data.statuses || {})
-    Object.assign(detectedPorts, data.ports || {})
+    applyServiceData(data)
   } catch (e) { lastError.value = e.message }
   finally { loading.value = false }
 }
 
-function startPolling() {
-  pollTimer = setInterval(async () => {
+function applyServiceData(data) {
+  services.value = data.services || []
+  Object.assign(statuses, data.statuses || {})
+  Object.assign(detectedPorts, data.ports || {})
+  for (const [id, st] of Object.entries(data.statuses || {})) {
+    if (st === 'running') delete failedMap[id]
+  }
+}
+
+// ─── WebSocket ───
+function connectWebSocket() {
+  if (ws) return
+  try {
+    ws = new WebSocket(WS_URL)
+    ws.onopen = () => {
+      wsRetryCount = 0
+      stopHttpFallback()
+    }
+    ws.onmessage = (event) => {
+      try {
+        const data = JSON.parse(event.data)
+        if (data.type === 'services') {
+          applyServiceData(data)
+        }
+      } catch { /* ignore parse errors */ }
+    }
+    ws.onclose = () => {
+      ws = null
+      scheduleWsReconnect()
+    }
+    ws.onerror = () => {
+      // onclose 会在 onerror 后自动触发，重连逻辑在里面处理
+    }
+  } catch {
+    scheduleWsReconnect()
+  }
+}
+
+function scheduleWsReconnect() {
+  if (wsReconnectTimer) return
+  if (wsRetryCount >= MAX_WS_RETRY) {
+    startHttpFallback()
+    return
+  }
+  const delay = Math.min(1000 * Math.pow(2, wsRetryCount), 30000)
+  wsRetryCount++
+  wsReconnectTimer = setTimeout(() => {
+    wsReconnectTimer = null
+    connectWebSocket()
+  }, delay)
+}
+
+function stopWsReconnect() {
+  if (wsReconnectTimer) { clearTimeout(wsReconnectTimer); wsReconnectTimer = null }
+}
+
+// ─── HTTP 降级兜底（WebSocket 连不上时） ───
+function startHttpFallback() {
+  if (httpFallbackTimer) return
+  backendOnline.value = false
+  httpFallbackTimer = setInterval(async () => {
     if (!await checkHealth()) return
     try {
       const data = await api.fetchServices()
-      services.value = data.services || []
-      Object.assign(statuses, data.statuses || {})
-      Object.assign(detectedPorts, data.ports || {})
-      // 如果后端报告运行中，清除本地失败标记
-      for (const [id, st] of Object.entries(data.statuses || {})) {
-        if (st === 'running') delete failedMap[id]
-      }
+      applyServiceData(data)
     } catch {}
     if (showLogPanel.value && activeLogTab.value) {
       try { logsMap[activeLogTab.value] = (await api.fetchLogs(activeLogTab.value)).logs || [] } catch {}
     }
-  }, 1000)
+  }, 10000) // HTTP 降级时每 10s 拉一次，不再是 1s
 }
+
+function stopHttpFallback() {
+  if (httpFallbackTimer) { clearInterval(httpFallbackTimer); httpFallbackTimer = null }
+}
+
+// ─── 日志轮询（日志面板打开时才启动） ───
+function startLogPolling() {
+  if (logPollTimer) return
+  logPollTimer = setInterval(async () => {
+    if (!showLogPanel.value || !activeLogTab.value) return
+    try { logsMap[activeLogTab.value] = (await api.fetchLogs(activeLogTab.value)).logs || [] } catch {}
+  }, 3000) // 日志 3s 轮询一次
+}
+
+function stopLogPolling() {
+  if (logPollTimer) { clearInterval(logPollTimer); logPollTimer = null }
+}
+
+// 用 watch 监听日志面板状态变化来自动启停日志轮询
+watch([showLogPanel, activeLogTab], ([panel, tab]) => {
+  if (panel && tab) startLogPolling()
+  else stopLogPolling()
+})
 
 onMounted(() => {
   loadSettings()
   applySettings(settings)
   setupSystemThemeListener()
-  loadServices().then(() => startPolling())
+  // 初始 HTTP 加载 + 健康检查
+  loadServices().then(() => {
+    // 然后再尝试 WebSocket
+    connectWebSocket()
+  })
 })
 onUnmounted(() => {
-  if (pollTimer) clearInterval(pollTimer)
+  if (ws) { ws.onclose = null; ws.close(); ws = null }
+  stopWsReconnect()
+  stopHttpFallback()
+  stopLogPolling()
   if (systemThemeListener) {
     window.matchMedia('(prefers-color-scheme: dark)').removeEventListener('change', systemThemeListener)
   }
@@ -338,7 +422,6 @@ function clearSelection() {
 async function batchStartSelected() {
   const ids = Object.entries(selectedMap).filter(([, v]) => v).map(([k]) => k)
   if (!ids.length) return
-  // 只启动未运行的服务
   const toStart = ids.filter(id => getStatus(id) !== 'running')
   const alreadyRunning = ids.length - toStart.length
   if (!toStart.length) {
@@ -346,29 +429,30 @@ async function batchStartSelected() {
     return
   }
   batRunning.value = true; batTotal.value = toStart.length; batDone.value = 0
-  let success = 0, failed = []
-  for (const id of toStart) {
-    try {
-      startingMap[id] = true
-      await api.startService(id)
-      delete failedMap[id]
-      success++
-    } catch (e) {
-      failed.push(id)
-      failedMap[id] = true
+  toStart.forEach(id => { startingMap[id] = true })
+  try {
+    const res = await api.batchStart(toStart)
+    const results = res.results || {}
+    let success = 0, failed = []
+    for (const id of toStart) {
+      if (results[id]?.ok) { success++; delete failedMap[id] }
+      else { failed.push(id); failedMap[id] = true }
     }
-    delete startingMap[id]
     batDone.value = success + failed.length
-  }
-  batRunning.value = false
-  let msg = `成功 ${success} 个`
-  if (failed.length) msg += `，失败 ${failed.length} 个`
-  if (alreadyRunning) msg += `，${alreadyRunning} 个已跳过`
-  if (failed.length) {
-    const names = failed.map(id => services.value.find(s => s.id === id)?.name || id).join('、')
-    ElMessage.warning(`${msg}，失败: ${names}`)
-  } else {
-    ElMessage.success(msg)
+    let msg = `成功 ${success} 个`
+    if (failed.length) msg += `，失败 ${failed.length} 个`
+    if (alreadyRunning) msg += `，${alreadyRunning} 个已跳过`
+    if (failed.length) {
+      const names = failed.map(id => services.value.find(s => s.id === id)?.name || id).join('、')
+      ElMessage.warning(`${msg}，失败: ${names}`)
+    } else {
+      ElMessage.success(msg)
+    }
+  } catch (e) {
+    ElMessage.error('批量启动失败: ' + e.message)
+  } finally {
+    toStart.forEach(id => { delete startingMap[id] })
+    batRunning.value = false
   }
 }
 
@@ -376,26 +460,27 @@ async function batchStopSelected() {
   const ids = Object.entries(selectedMap).filter(([, v]) => v).map(([k]) => k)
   if (!ids.length) return
   batRunning.value = true; batTotal.value = ids.length; batDone.value = 0
-  let success = 0, failed = []
-  for (const id of ids) {
-    try {
-      await api.stopService(id)
-      statuses[id] = 'stopped'
-      delete failedMap[id]
-      success++
-    } catch (e) {
-      failed.push(id)
+  try {
+    const res = await api.batchStop(ids)
+    const results = res.results || {}
+    let success = 0, failed = []
+    for (const id of ids) {
+      if (results[id]?.ok) { success++; statuses[id] = 'stopped'; delete failedMap[id] }
+      else { failed.push(id) }
     }
     batDone.value = success + failed.length
-  }
-  batRunning.value = false
-  let msg = `成功 ${success} 个`
-  if (failed.length) {
-    const names = failed.map(id => services.value.find(s => s.id === id)?.name || id).join('、')
-    msg += `，失败 ${failed.length} 个: ${names}`
-    ElMessage.warning(msg)
-  } else {
-    ElMessage.success(msg)
+    let msg = `成功 ${success} 个`
+    if (failed.length) {
+      const names = failed.map(id => services.value.find(s => s.id === id)?.name || id).join('、')
+      msg += `，失败 ${failed.length} 个: ${names}`
+      ElMessage.warning(msg)
+    } else {
+      ElMessage.success(msg)
+    }
+  } catch (e) {
+    ElMessage.error('批量停止失败: ' + e.message)
+  } finally {
+    batRunning.value = false
   }
 }
 

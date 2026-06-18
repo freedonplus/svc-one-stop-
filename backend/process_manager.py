@@ -11,6 +11,31 @@ from fastapi import HTTPException
 import log_store
 
 
+# ─── Windows 控制台隐藏工具 ───
+if sys.platform == "win32":
+    import ctypes
+    _kernel32 = ctypes.windll.kernel32
+    # DETACHED_PROCESS: 子进程不关联任何控制台
+    # CREATE_NO_WINDOW:  子进程不创建控制台窗口
+    _HIDE_FLAGS = 0x00000008 | 0x08000000
+    # 不是 pywin32 也可以的 —— ctypes 直接调 CreateProcessW
+    # 但 subprocess 内部会帮我们调，我们只需传 flags
+
+    pass
+else:
+    pass
+
+
+def _run_hidden(args, **kwargs):
+    """运行子进程并隐藏控制台窗口（Windows），默认 capture_output"""
+    if sys.platform == "win32":
+        kwargs.setdefault("creationflags", _HIDE_FLAGS)
+    kwargs.setdefault("capture_output", True)
+    kwargs.setdefault("text", True)
+    kwargs.setdefault("timeout", 15)  # 系统繁忙时 netstat/tasklist 可能较慢
+    return subprocess.run(args, **kwargs)
+
+
 _lock = threading.RLock()
 # { service_id: { proc, reader_thread } }
 _running: dict[str, dict] = {}
@@ -98,17 +123,31 @@ def start(service_id: str, svc: dict) -> dict:
         env.update(svc["env"])
 
     try:
-        proc = subprocess.Popen(
-            command,
-            shell=True,
-            cwd=cwd,
-            env=env,
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            text=True,
-            bufsize=1,
-            creationflags=subprocess.CREATE_NO_WINDOW if sys.platform == "win32" else 0,
-        )
+        if sys.platform == "win32":
+            # Windows: 不用 shell=True（避免 cmd.exe 弹窗），
+            # 直接创建进程 + 双保险隐藏标志
+            proc = subprocess.Popen(
+                command,
+                shell=False,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+                creationflags=_HIDE_FLAGS,
+            )
+        else:
+            proc = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=cwd,
+                env=env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
     except Exception as e:
         _syslog(service_id, f"启动失败: {e}")
         raise HTTPException(500, f"启动失败: {e}")
@@ -120,8 +159,11 @@ def start(service_id: str, svc: dict) -> dict:
     thread.start()
     _recently_stopped.pop(service_id, None)  # 启动成功，清除冷却
 
-    # 等待一小段时间，检测进程是否立即退出（常见于端口被占用）
-    time.sleep(1)
+    # 快速检测进程是否立即退出（常见于端口被占用），每 100ms 探一次
+    for _ in range(10):
+        time.sleep(0.1)
+        if proc.poll() is not None:
+            break
     if proc.poll() is not None:
         logs = log_store.get_logs(service_id, 30)
         err_text = "\n".join(logs).lower()
@@ -143,7 +185,7 @@ def detect_status(service_id: str, svc: dict) -> dict:
 def _kill_process_by_port(port: int) -> bool:
     """通过监听端口终止进程"""
     try:
-        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=3).stdout
+        out = _run_hidden(["netstat", "-ano"], timeout=3).stdout
         target_pid = None
         for line in out.splitlines():
             parts = line.strip().split()
@@ -154,7 +196,7 @@ def _kill_process_by_port(port: int) -> bool:
                     target_pid = pid
                     break
         if target_pid:
-            subprocess.run(["taskkill", "/F", "/PID", target_pid], capture_output=True, timeout=5)
+            _run_hidden(["taskkill", "/F", "/PID", target_pid])
             return True
     except:
         pass
@@ -184,8 +226,8 @@ def stop(service_id: str, svc: dict | None = None) -> dict:
         if not port and svc:
             cmd = svc.get("command", "")
             exe = _get_exe_name(cmd)
-            listening = _scan_system_ports()
-            all_procs = _scan_system_processes()
+            listening = _cached_scan("ports", _scan_system_ports)
+            all_procs = _cached_scan("procs", _scan_system_processes)
             for pid in all_procs.get(exe, set()):
                 for p in listening.get(pid, set()):
                     port = int(p)
@@ -212,10 +254,8 @@ def stop(service_id: str, svc: dict | None = None) -> dict:
 
     try:
         if sys.platform == "win32":
-            subprocess.run(
+            _run_hidden(
                 ["taskkill", "/F", "/T", "/PID", str(proc.pid)],
-                capture_output=True,
-                timeout=5,
             )
         else:
             proc.send_signal(signal.SIGTERM)
@@ -257,7 +297,7 @@ def _scan_system_ports() -> dict[str, set[str]]:
     """扫描系统所有监听端口 → {pid: {port, ...}}"""
     result = {}
     try:
-        out = subprocess.run(["netstat", "-ano"], capture_output=True, text=True, timeout=3).stdout
+        out = _run_hidden(["netstat", "-ano"], timeout=3).stdout
         for line in out.splitlines():
             parts = line.strip().split()
             if len(parts) >= 5 and "LISTENING" in line:
@@ -275,7 +315,7 @@ def _scan_system_processes() -> dict[str, set[str]]:
     """扫描系统所有进程 → {exe_name: {pid, ...}}"""
     result = {}
     try:
-        out = subprocess.run(["tasklist", "/FO", "CSV"], capture_output=True, text=True, timeout=3).stdout
+        out = _run_hidden(["tasklist", "/FO", "CSV"]).stdout
         for line in out.splitlines()[1:]:
             parts = line.split(",")
             if len(parts) >= 2:
@@ -299,8 +339,8 @@ def _get_exe_name(command: str) -> str:
 def collect_statuses(service_ids: list[str], services: list[dict] | None = None) -> dict[str, str]:
     """批量获取状态，同时清理已退出的残留记录。services 可选传入以做外部进程检测。"""
     # 全系统扫描一次，供所有服务复用
-    listening = _scan_system_ports()   # {pid: {port,...}}
-    all_procs = _scan_system_processes()  # {exe: {pid,...}}
+    listening = _cached_scan("ports", _scan_system_ports)   # {pid: {port,...}}
+    all_procs = _cached_scan("procs", _scan_system_processes)  # {exe: {pid,...}}
 
     statuses = {}
     svc_map = {s["id"]: s for s in (services or [])}
@@ -330,6 +370,20 @@ def collect_statuses(service_ids: list[str], services: list[dict] | None = None)
                 continue
             statuses[sid] = "stopped"
     return statuses
+
+
+# ─── 系统扫描缓存（避免每 5 秒重复 netstat 级开销） ───
+_scan_cache: dict[str, tuple[float, object]] = {}
+_SCAN_CACHE_TTL = 2.0  # 秒
+
+def _cached_scan(key: str, fn, *args):
+    now = time.time()
+    cached = _scan_cache.get(key)
+    if cached and now - cached[0] < _SCAN_CACHE_TTL:
+        return cached[1]
+    result = fn(*args)
+    _scan_cache[key] = (now, result)
+    return result
 
 
 # 通用运行时 exe 名——不靠进程名匹配（多个服务共用一个 exe，无法区分）
@@ -434,8 +488,8 @@ def _detect_port_from_logs(service_id: str) -> int | None:
 
 def collect_ports(service_ids: list[str], services: list[dict] | None = None) -> dict[str, int]:
     """批量检测各服务的端口号"""
-    listening = _scan_system_ports()
-    all_procs = _scan_system_processes()
+    listening = _cached_scan("ports", _scan_system_ports)
+    all_procs = _cached_scan("procs", _scan_system_processes)
     svc_map = {s["id"]: s for s in (services or [])}
     ports = {}
     for sid in service_ids:

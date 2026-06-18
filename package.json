@@ -5,8 +5,12 @@
   "type": "module",
   "scripts": {
     "dev": "vite",
-    "dev:all": "concurrently -n vite,python -c cyan,green \"vite\" \"python backend/main.py\"",
+    "dev:backend": "pythonw backend/main.py",
+    "dev:all": "concurrently -n vite,python -c cyan,green \"vite\" \"pythonw backend/main.py\"",
+    "dev:all:verbose": "concurrently -n vite,python -c cyan,green \"vite\" \"python backend/main.py\"",
     "build": "vite build",
+    "build:backend": "pyinstaller --onefile --name onestopservice-backend --distpath src-tauri/resources --noconsole backend/main.py",
+    "build:all": "npm run build && npm run build:backend",
     "preview": "vite preview",
     "tauri": "tauri"
   },

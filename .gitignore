@@ -37,3 +37,10 @@ work/
 # Rust build cache
 src-tauri/target/
 src-tauri/gen/schemas/
+
+# PyInstaller build artifacts
+build/
+*.spec
+*.exe
+!src-tauri/resources/.gitkeep
+src-tauri/resources/*.exe
