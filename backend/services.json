@@ -1,0 +1,79 @@
+[
+  {
+    "name": "MySQL",
+    "command": "D:\\tool\\mysql\\bin\\mysqld --defaults-file=D:\\tool\\mysql\\my.ini",
+    "cwd": null,
+    "port": 3306,
+    "env": null,
+    "color": "#409eff",
+    "log_file": "D:\\tool\\mysql\\data\\TaiShangXue.err",
+    "group": "数据库",
+    "version": null,
+    "url": null,
+    "id": "mysql"
+  },
+  {
+    "name": "Redis",
+    "command": "D:\\tool\\redis\\Redis-x64-3.0.504\\redis-server.exe",
+    "cwd": null,
+    "port": null,
+    "env": null,
+    "color": "#409eff",
+    "group": "缓存",
+    "version": null,
+    "url": null,
+    "id": "redis"
+  },
+  {
+    "name": "RabbitMq",
+    "command": "D:\\tool\\RabbitMQ\\rabbitmq_server-4.3.1\\sbin\\rabbitmq-server.bat",
+    "cwd": "D:\\tool\\RabbitMQ",
+    "port": 15672,
+    "env": {
+      "ERLANG_HOME": "D:\\tool\\RabbitMQ\\erlang",
+      "RABBITMQ_SERVER_START_ARGS": "-detached"
+    },
+    "color": "#67c23a",
+    "group": "中间件",
+    "version": null,
+    "url": "http://localhost:15672",
+    "log_file": "D:\\tool\\RabbitMQ\\log\\rabbit@TaiShangXue.log",
+    "id": "rabbitmq"
+  },
+  {
+    "name": "Nacos",
+    "command": "set \"JAVA_HOME=D:\\Program Files\\java\\java17\" && D:\\tool\\nacos\\nacos\\bin\\startup.cmd -m standalone",
+    "cwd": null,
+    "port": null,
+    "env": null,
+    "color": "#e6a23c",
+    "group": "微服务",
+    "version": null,
+    "url": "http://localhost:8849",
+    "id": "nacos"
+  },
+  {
+    "name": "Sentinel",
+    "command": "java -jar D:\\tool\\sentinel\\sentinel-dashboard-1.8.10.jar --server.port=8888",
+    "cwd": null,
+    "port": null,
+    "env": null,
+    "color": "#e6a23c",
+    "group": "微服务",
+    "version": null,
+    "url": "http://localhost:8888/",
+    "id": "sentinel"
+  },
+  {
+    "name": "ZipKin",
+    "command": "java -jar D:\\tool\\zipkin\\zipkin-server-3.4.2-exec.jar",
+    "cwd": null,
+    "port": null,
+    "env": null,
+    "color": "#409eff",
+    "group": "微服务",
+    "version": null,
+    "url": "http://localhost:9411",
+    "id": "zipkin"
+  }
+]

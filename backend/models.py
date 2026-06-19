@@ -14,6 +14,7 @@ class ServiceConfig(BaseModel):
     group: Optional[str] = None
     version: Optional[str] = None
     url: Optional[str] = None
+    log_file: Optional[str] = None
 
 
 class ServiceItem(ServiceConfig):

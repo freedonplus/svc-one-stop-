@@ -15,11 +15,36 @@ import log_store
 if sys.platform == "win32":
     import ctypes
     _kernel32 = ctypes.windll.kernel32
+    _user32 = ctypes.windll.user32
     # DETACHED_PROCESS: 子进程不关联任何控制台
     # CREATE_NO_WINDOW:  子进程不创建控制台窗口
     _HIDE_FLAGS = 0x00000008 | 0x08000000
-    # 不是 pywin32 也可以的 —— ctypes 直接调 CreateProcessW
-    # 但 subprocess 内部会帮我们调，我们只需传 flags
+
+    # 隐藏控制台标志（防止占用后忘记释放）
+    _console_hidden = False
+
+    def _ensure_hidden_console():
+        """在父进程中分配一个隐藏的控制台。
+
+        部分 Windows 控制台程序（mysqld、erl.exe 等）启动时检测到没有
+        控制台会主动 AllocConsole() 弹出新窗口。解决方式：让父进程
+        预先分配一个隐藏控制台，子进程直接继承它就老实了。
+        """
+        global _console_hidden
+        if _console_hidden:
+            return
+        try:
+            # 如果已有控制台（python.exe 运行），直接隐藏它
+            hwnd = _kernel32.GetConsoleWindow()
+            if hwnd:
+                _user32.ShowWindow(hwnd, 0)  # SW_HIDE
+            else:
+                # pythonw 运行，无控制台 → 分配一个隐藏的
+                if _kernel32.AllocConsole():
+                    _user32.ShowWindow(_kernel32.GetConsoleWindow(), 0)
+            _console_hidden = True
+        except Exception:
+            pass
 
     pass
 else:
@@ -44,6 +69,53 @@ _external_running: set[str] = set()
 # 最近手动停止的服务（冷却期内不重新检测）
 _recently_stopped: dict[str, float] = {}
 _STOP_COOLDOWN = 15  # 秒
+# 文件日志尾随线程 { service_id: stop_event }
+_file_watchers: dict[str, threading.Event] = {}
+
+
+def _file_log_watcher(file_path: str, service_id: str, stop: threading.Event):
+    """后台线程：尾随日志文件，新行追加到日志缓冲区"""
+    buffer = log_store.get_buffer(service_id)
+    if buffer is None:
+        return
+    import time
+    # 等文件出现（最长 ~15 秒）
+    f = None
+    for _ in range(30):
+        if stop.is_set():
+            return
+        try:
+            f = open(file_path, "r", encoding="utf-8", errors="replace")
+            break
+        except FileNotFoundError:
+            time.sleep(0.5)
+    if f is None:
+        buffer.append(f"[系统] 日志文件不可用: {file_path}")
+        return
+    with f:
+        # 先读末尾 20 行作为上下文
+        try:
+            lines = f.readlines()
+            for line in lines[-20:]:
+                if stop.is_set():
+                    return
+                text = line.rstrip("\r\n")
+                if text:
+                    buffer.append(text)
+        except Exception:
+            pass
+        # 持续尾随
+        while not stop.is_set():
+            try:
+                line = f.readline()
+                if line:
+                    text = line.rstrip("\r\n")
+                    if text:
+                        buffer.append(text)
+                else:
+                    time.sleep(0.5)
+            except Exception:
+                time.sleep(1)
 
 
 def _log_reader(proc: subprocess.Popen, service_id: str):
@@ -81,6 +153,25 @@ def _syslog(service_id: str, msg: str):
         buf.append(f"[系统] {msg}")
 
 
+def _start_file_watcher(service_id: str, svc: dict):
+    """如果服务配置了 log_file，启动文件日志尾随线程"""
+    log_file = svc.get("log_file")
+    if not log_file:
+        return
+    # 停止已有的 watcher
+    old_ev = _file_watchers.pop(service_id, None)
+    if old_ev:
+        old_ev.set()
+    stop_ev = threading.Event()
+    _file_watchers[service_id] = stop_ev
+    t = threading.Thread(
+        target=_file_log_watcher,
+        args=(log_file, service_id, stop_ev),
+        daemon=True,
+    )
+    t.start()
+
+
 def start(service_id: str, svc: dict) -> dict:
     """启动一个服务进程"""
     with _lock:
@@ -89,6 +180,9 @@ def start(service_id: str, svc: dict) -> dict:
 
     # 创建日志缓冲区，写入启动标记
     log_store.create_buffer(service_id)
+
+    # 文件日志尾随（如果配置了 log_file 则尾随日志文件）
+    _start_file_watcher(service_id, svc)
 
     # 启动前杀掉占用冲突端口的旧进程（只杀端口占用，不杀同名 exe）
     svc_name = svc.get("name", "").lower()
@@ -124,18 +218,34 @@ def start(service_id: str, svc: dict) -> dict:
 
     try:
         if sys.platform == "win32":
-            # Windows: 不用 shell=True（避免 cmd.exe 弹窗），
-            # 直接创建进程 + 双保险隐藏标志
+            # 部分程序（mysqld、erl.exe）检测到无控制台会自建弹窗，
+            # 对它们先分配一个隐藏控制台再启动，且不加 _HIDE_FLAGS（否则仍会弹窗）
+            _is_console_app = "mysqld" in command.lower()
+            if _is_console_app:
+                _ensure_hidden_console()
+
+            _si = subprocess.STARTUPINFO()
+            _si.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            _si.wShowWindow = subprocess.SW_HIDE
+
+            # 判断是否需要 shell 解释器
+            _need_shell = (
+                command.lower().endswith((".bat", ".cmd"))
+                or " && " in command
+                or " || " in command
+                or command.strip().startswith("set ")
+            )
             proc = subprocess.Popen(
                 command,
-                shell=False,
+                shell=_need_shell,
                 cwd=cwd,
                 env=env,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.STDOUT,
                 text=True,
                 bufsize=1,
-                creationflags=_HIDE_FLAGS,
+                startupinfo=_si,
+                creationflags=0 if _is_console_app else _HIDE_FLAGS,
             )
         else:
             proc = subprocess.Popen(
@@ -159,19 +269,37 @@ def start(service_id: str, svc: dict) -> dict:
     thread.start()
     _recently_stopped.pop(service_id, None)  # 启动成功，清除冷却
 
-    # 快速检测进程是否立即退出（常见于端口被占用），每 100ms 探一次
+    # 快速检测进程是否立即退出（常见于端口被占用/后台模式），每 100ms 探一次
     for _ in range(10):
         time.sleep(0.1)
         if proc.poll() is not None:
             break
     if proc.poll() is not None:
+        exit_code = proc.poll()
         logs = log_store.get_logs(service_id, 30)
         err_text = "\n".join(logs).lower()
+
         if "already in use" in err_text or "bind" in err_text or "address in use" in err_text or "must be writable" in err_text:
             _syslog(service_id, "检测到服务已在外部运行中")
             _external_running.add(service_id)
             _running.pop(service_id, None)
             return {"ok": True, "external": True}
+
+        # 批处理/后台模式：进程退出但无报错 → 等待端口就绪
+        svc_port = svc.get("port")
+        if exit_code == 0 and svc_port:
+            _syslog(service_id, f"后台启动中，等待端口 {svc_port}...")
+            _running.pop(service_id, None)
+            # 最长等 8 秒（每秒查一次端口）
+            for _ in range(8):
+                time.sleep(1)
+                if _check_port(int(svc_port)):
+                    _external_running.add(service_id)
+                    _syslog(service_id, f"端口 {svc_port} 已就绪")
+                    return {"ok": True, "external": True}
+            _syslog(service_id, f"端口 {svc_port} 未就绪，可能启动较慢")
+            # 即使没有立即就绪也返回成功——后台持续检测
+            return {"ok": True, "external": True, "pending": True}
 
     return {"ok": True, "pid": proc.pid}
 
@@ -217,6 +345,10 @@ def _is_on_cooldown(service_id: str) -> bool:
 def stop(service_id: str, svc: dict | None = None) -> dict:
     """停止一个服务进程（日志保留）"""
     _mark_stopped(service_id)
+    # 停止文件日志尾随
+    _stop_ev = _file_watchers.pop(service_id, None)
+    if _stop_ev:
+        _stop_ev.set()
     # 外部运行的服务 - 通过端口查进程并终止
     if service_id in _external_running:
         _external_running.discard(service_id)
